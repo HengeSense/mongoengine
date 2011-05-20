@@ -812,8 +812,17 @@ class QuerySet(object):
 
         if limit:
             mr_args['limit'] = limit
-        results = self._collection.map_reduce(map_f, reduce_f, output, **mr_args)
-        results = results.find()
+            
+        if output == 'inline' or (not keep_temp and not self._ordering):
+            map_reduce_function = 'inline_map_reduce'
+        else:
+            map_reduce_function = 'map_reduce'
+            mr_args['out'] = output
+            
+        results = getattr(self._collection, map_reduce_function)(map_f, reduce_f, **mr_args)
+        
+        if map_reduce_function == 'map_reduce':
+            results = results.find()
 
         if self._ordering:
             results = results.sort(self._ordering)
