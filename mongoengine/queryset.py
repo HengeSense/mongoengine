@@ -1542,6 +1542,35 @@ class QuerySet(object):
             data[None] = data['undefined']
             del(data['undefined'])
         return data
+        
+    def item_frequencies_mr(self, field):
+        map_func = """
+            function() {
+                if (this[~%(field)s].constructor == Array) {
+                    this[~%(field)s].forEach(function(item) {
+                        emit(item, 1);
+                    });
+                } else {
+                    emit(this[~%(field)s], 1);
+                }
+            }
+        """ % dict(field=field)
+        reduce_func = """
+            function(key, values) {
+                var total = 0;
+                var valuesSize = values.length;
+                for (var i=0; i < valuesSize; i++) {
+                    total += parseInt(values[i], 10);
+                }
+                return total;
+            }
+        """
+        values            = self.map_reduce(map_func, reduce_func, 'inline', keep_temp=False)
+        frequencies       = {}
+        for f in values:
+            frequencies[f.key] = f.value
+        
+        return frequencies
 
     def __repr__(self):
         limit = REPR_OUTPUT_SIZE + 1
