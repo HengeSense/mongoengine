@@ -7,6 +7,7 @@ from mongoengine.queryset import (QuerySet, QuerySetManager,
                                   MultipleObjectsReturned, DoesNotExist,
                                   QueryFieldList)
 from mongoengine import *
+from mongoengine.connection import _get_connection
 from mongoengine.tests import query_counter
 
 
@@ -14,7 +15,7 @@ class QuerySetTest(unittest.TestCase):
 
     def setUp(self):
         connect(db='mongoenginetest')
-
+        
         class Person(Document):
             name = StringField()
             age = IntField()
@@ -2196,7 +2197,32 @@ class QuerySetTest(unittest.TestCase):
         events = Event.objects(location__within_box=box)
         self.assertEqual(events.count(), 1)
         self.assertEqual(events[0].id, event2.id)
-
+        
+        # check that polygon works for users who have a server >= 1.9
+        server_version = tuple(
+            _get_connection().server_info()['version'].split('.')
+        )
+        required_version = tuple("1.9.0".split("."))
+        if server_version >= required_version:
+            polygon = [
+                (41.912114,-87.694445),
+                (41.919395,-87.69084),
+                (41.927186,-87.681742),
+                (41.911731,-87.654276),
+                (41.898061,-87.656164),
+            ]
+            events = Event.objects(location__within_polygon=polygon)
+            self.assertEqual(events.count(), 1)
+            self.assertEqual(events[0].id, event1.id)
+            
+            polygon2 = [
+                (54.033586,-1.742249),
+                (52.792797,-1.225891),
+                (53.389881,-4.40094)
+            ]
+            events = Event.objects(location__within_polygon=polygon2)
+            self.assertEqual(events.count(), 0)
+            
         Event.drop_collection()
 
     def test_spherical_geospatial_operators(self):
@@ -2315,6 +2341,56 @@ class QuerySetTest(unittest.TestCase):
         Post(is_published=True).save()
         self.assertEquals(Post.objects.count(), 2)
         self.assertEquals(Post.published.count(), 1)
+
+        Post.drop_collection()
+
+    def test_custom_querysets_inherited(self):
+        """Ensure that custom QuerySet classes may be used.
+        """
+
+        class CustomQuerySet(QuerySet):
+            def not_empty(self):
+                return len(self) > 0
+
+        class Base(Document):
+            meta = {'abstract': True, 'queryset_class': CustomQuerySet}
+
+        class Post(Base):
+            pass
+
+        Post.drop_collection()
+        self.assertTrue(isinstance(Post.objects, CustomQuerySet))
+        self.assertFalse(Post.objects.not_empty())
+
+        Post().save()
+        self.assertTrue(Post.objects.not_empty())
+
+        Post.drop_collection()
+
+    def test_custom_querysets_inherited_direct(self):
+        """Ensure that custom QuerySet classes may be used.
+        """
+
+        class CustomQuerySet(QuerySet):
+            def not_empty(self):
+                return len(self) > 0
+
+        class CustomQuerySetManager(QuerySetManager):
+            queryset_class = CustomQuerySet
+
+        class Base(Document):
+            meta = {'abstract': True}
+            objects = CustomQuerySetManager()
+
+        class Post(Base):
+            pass
+
+        Post.drop_collection()
+        self.assertTrue(isinstance(Post.objects, CustomQuerySet))
+        self.assertFalse(Post.objects.not_empty())
+
+        Post().save()
+        self.assertTrue(Post.objects.not_empty())
 
         Post.drop_collection()
 
@@ -2451,6 +2527,47 @@ class QuerySetTest(unittest.TestCase):
                  value.get('sparse', False))
                 for key, value in info.iteritems()]
         self.assertTrue(([('_types', 1), ('message', 1)], False, False) in info)
+
+    def test_where(self):
+        """Ensure that where clauses work.
+        """
+
+        class IntPair(Document):
+            fielda = IntField()
+            fieldb = IntField()
+
+        IntPair.objects._collection.remove()
+
+        a = IntPair(fielda=1, fieldb=1)
+        b = IntPair(fielda=1, fieldb=2)
+        c = IntPair(fielda=2, fieldb=1)
+        a.save()
+        b.save()
+        c.save()
+
+        query = IntPair.objects.where('this[~fielda] >= this[~fieldb]')
+        self.assertEqual('this["fielda"] >= this["fieldb"]', query._where_clause)
+        results = list(query)
+        self.assertEqual(2, len(results))
+        self.assertTrue(a in results)
+        self.assertTrue(c in results)
+
+        query = IntPair.objects.where('this[~fielda] == this[~fieldb]')
+        results = list(query)
+        self.assertEqual(1, len(results))
+        self.assertTrue(a in results)
+
+        query = IntPair.objects.where('function() { return this[~fielda] >= this[~fieldb] }')
+        self.assertEqual('function() { return this["fielda"] >= this["fieldb"] }', query._where_clause)
+        results = list(query)
+        self.assertEqual(2, len(results))
+        self.assertTrue(a in results)
+        self.assertTrue(c in results)
+
+        def invalid_where():
+            list(IntPair.objects.where(fielda__gte=3))
+
+        self.assertRaises(TypeError, invalid_where)
 
 
 class QTest(unittest.TestCase):

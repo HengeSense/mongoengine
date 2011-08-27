@@ -339,7 +339,6 @@ class DocumentMetaclass(type):
             # Include all fields present in superclasses
             if hasattr(base, '_fields'):
                 doc_fields.update(base._fields)
-                class_name.append(base._class_name)
                 # Get superclasses from superclass
                 superclasses[base._class_name] = base
                 superclasses.update(base._superclasses)
@@ -351,6 +350,7 @@ class DocumentMetaclass(type):
                 # Ensure that the Document class may be subclassed -
                 # inheritance may be disabled to remove dependency on
                 # additional fields _cls and _types
+                class_name.append(base._class_name)
                 if base._meta.get('allow_inheritance', True) == False:
                     raise ValueError('Document %s may not be subclassed' %
                                      base.__name__)
@@ -381,7 +381,8 @@ class DocumentMetaclass(type):
                     attr_value.db_field = attr_name
                 doc_fields[attr_name] = attr_value
         attrs['_fields'] = doc_fields
-        attrs['_db_field_map'] = dict([(k, v.db_field) for k, v in doc_fields.items()])
+        attrs['_db_field_map'] = dict([(k, v.db_field) for k, v in doc_fields.items() if k!=v.db_field])
+        attrs['_reverse_db_field_map'] = dict([(v, k) for k, v in attrs['_db_field_map'].items()])
 
         new_class = super_new(cls, name, bases, attrs)
         for field in new_class._fields.values():
@@ -446,7 +447,6 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
         # Subclassed documents inherit collection from superclass
         for base in bases:
             if hasattr(base, '_meta'):
-
                 if 'collection' in attrs.get('meta', {}) and not base._meta.get('abstract', False):
                     import warnings
                     msg = "Trying to set a collection on a subclass (%s)" % name
@@ -464,14 +464,20 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
                 # Propagate 'allow_inheritance'
                 if 'allow_inheritance' in base._meta:
                     base_meta['allow_inheritance'] = base._meta['allow_inheritance']
+                if 'queryset_class' in base._meta:
+                    base_meta['queryset_class'] = base._meta['queryset_class']
+            try:
+                base_meta['objects'] = base.__getattribute__(base, 'objects')
+            except AttributeError:
+                pass
 
         meta = {
             'abstract': False,
             'collection': collection,
             'max_documents': None,
             'max_size': None,
-            'ordering': [], # default ordering applied at runtime
-            'indexes': [], # indexes to be ensured at runtime
+            'ordering': [],  # default ordering applied at runtime
+            'indexes': [],  # indexes to be ensured at runtime
             'id_field': id_field,
             'index_background': False,
             'index_drop_dups': False,
@@ -495,7 +501,7 @@ class TopLevelDocumentMetaclass(DocumentMetaclass):
             new_class._meta['collection'] = collection(new_class)
 
         # Provide a default queryset unless one has been manually provided
-        manager = attrs.get('objects', QuerySetManager())
+        manager = attrs.get('objects', meta.get('objects', QuerySetManager()))
         if hasattr(manager, 'queryset_class'):
             meta['queryset_class'] = manager.queryset_class
         new_class.objects = manager
@@ -571,6 +577,7 @@ class BaseDocument(object):
         signals.pre_init.send(self.__class__, document=self, values=values)
 
         self._data = {}
+        self._initialised = False
         # Assign default values to instance
         for attr_name, field in self._fields.items():
             value = getattr(self, attr_name, None)
@@ -586,7 +593,8 @@ class BaseDocument(object):
 
         # Set any get_fieldname_display methods
         self.__set_field_display()
-
+        # Flag initialised
+        self._initialised = True
         signals.post_init.send(self.__class__, document=self)
 
     def validate(self):
@@ -663,7 +671,6 @@ class BaseDocument(object):
         # get the class name from the document, falling back to the given
         # class if unavailable
         class_name = son.get(u'_cls', cls._class_name)
-
         data = dict((str(key), value) for key, value in son.items())
 
         if '_types' in data:
@@ -678,7 +685,11 @@ class BaseDocument(object):
             if class_name not in subclasses:
                 # Type of document is probably more generic than the class
                 # that has been queried to return this SON
-                return None
+                raise NotRegistered("""
+                        `%s` has not been registered in the document registry.
+                        Importing the document class automatically registers it,
+                        has it been imported?
+                    """.strip() % class_name)
             cls = subclasses[class_name]
 
         present_fields = data.keys()
@@ -713,12 +724,18 @@ class BaseDocument(object):
             field = getattr(self, field_name, None)
             if isinstance(field, EmbeddedDocument) and db_field_name not in _changed_fields:  # Grab all embedded fields that have been changed
                 _changed_fields += ["%s%s" % (key, k) for k in field._get_changed_fields(key) if k]
-            elif isinstance(field, (list, tuple)) and db_field_name not in _changed_fields:  # Loop list fields as they contain documents
-                for index, value in enumerate(field):
+            elif isinstance(field, (list, tuple, dict)) and db_field_name not in _changed_fields:  # Loop list / dict fields as they contain documents
+                # Determine the iterator to use
+                if not hasattr(field, 'items'):
+                    iterator = enumerate(field)
+                else:
+                    iterator = field.iteritems()
+                for index, value in iterator:
                     if not hasattr(value, '_get_changed_fields'):
                         continue
                     list_key = "%s%s." % (key, index)
                     _changed_fields += ["%s%s" % (list_key, k) for k in value._get_changed_fields(list_key) if k]
+
         return _changed_fields
 
     def _delta(self):
@@ -728,7 +745,6 @@ class BaseDocument(object):
         # Handles cases where not loaded from_son but has _id
         doc = self.to_mongo()
         set_fields = self._get_changed_fields()
-
         set_data = {}
         unset_data = {}
         if hasattr(self, '_changed_fields'):
@@ -755,7 +771,7 @@ class BaseDocument(object):
             if value:
                 continue
 
-            # If we've set a value that ain't the default value unset it.
+            # If we've set a value that ain't the default value dont unset it.
             default = None
 
             if path in self._fields:
@@ -763,22 +779,27 @@ class BaseDocument(object):
             else:  # Perform a full lookup for lists / embedded lookups
                 d = self
                 parts = path.split('.')
-                field_name = parts.pop()
+                db_field_name = parts.pop()
                 for p in parts:
                     if p.isdigit():
                         d = d[int(p)]
-                    elif hasattr(d, '__getattribute__'):
-                        d = getattr(d, p)
+                    elif hasattr(d, '__getattribute__') and not isinstance(d, dict):
+                        real_path = d._reverse_db_field_map.get(p, p)
+                        d = getattr(d, real_path)
                     else:
                         d = d.get(p)
+
                 if hasattr(d, '_fields'):
+                    field_name = d._reverse_db_field_map.get(db_field_name,
+                                                             db_field_name)
+
                     default = d._fields[field_name].default
 
             if default is not None:
                 if callable(default):
                     default = default()
-                if default != value:
-                    continue
+            if default != value:
+                continue
 
             del(set_data[path])
             unset_data[path] = 1
@@ -794,7 +815,8 @@ class BaseDocument(object):
                 field_cls = field.document_type
                 if field_cls in inspected_classes:
                     continue
-                geo_indices += field_cls._geo_indices(inspected_classes)
+                if hasattr(field_cls, '_geo_indices'):
+                    geo_indices += field_cls._geo_indices(inspected_classes)
             elif field._geo_index:
                 geo_indices.append(field)
         return geo_indices

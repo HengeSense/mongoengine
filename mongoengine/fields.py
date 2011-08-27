@@ -20,7 +20,8 @@ __all__ = ['StringField', 'IntField', 'FloatField', 'BooleanField',
            'ObjectIdField', 'ReferenceField', 'ValidationError', 'MapField',
            'DecimalField', 'ComplexDateTimeField', 'URLField',
            'GenericReferenceField', 'FileField', 'BinaryField',
-           'SortedListField', 'EmailField', 'GeoPointField']
+           'SortedListField', 'EmailField', 'GeoPointField',
+           'SequenceField']
 
 RECURSIVE_REFERENCE_CONSTANT = 'self'
 
@@ -619,7 +620,7 @@ class GenericReferenceField(BaseField):
     """A reference to *any* :class:`~mongoengine.document.Document` subclass
     that will be automatically dereferenced on access (lazily).
 
-    note:  Any documents used as a generic reference must be registered in the
+    ..note ::  Any documents used as a generic reference must be registered in the
     document registry.  Importing the model will automatically register it.
 
     .. versionadded:: 0.3
@@ -876,3 +877,61 @@ class GeoPointField(BaseField):
         if (not isinstance(value[0], (float, int)) and
             not isinstance(value[1], (float, int))):
             raise ValidationError('Both values in point must be float or int.')
+
+
+class SequenceField(IntField):
+    """Provides a sequental counter.
+
+    ..note:: Although traditional databases often use increasing sequence
+             numbers for primary keys. In MongoDB, the preferred approach is to
+             use Object IDs instead.  The concept is that in a very large
+             cluster of machines, it is easier to create an object ID than have
+             global, uniformly increasing sequence numbers.
+
+    .. versionadded:: 0.5
+    """
+    def __init__(self, collection_name=None, *args, **kwargs):
+        self.collection_name = collection_name or 'mongoengine.counters'
+        return super(SequenceField, self).__init__(*args, **kwargs)
+
+    def generate_new_value(self):
+        """
+        Generate and Increment the counter
+        """
+        sequence_id = "{0}.{1}".format(self.owner_document._get_collection_name(),
+                                       self.name)
+        collection = _get_db()[self.collection_name]
+        counter = collection.find_and_modify(query={"_id": sequence_id},
+                                             update={"$inc": {"next": 1}},
+                                             new=True,
+                                             upsert=True)
+        return counter['next']
+
+    def __get__(self, instance, owner):
+
+        if instance is None:
+            return self
+
+        if not instance._data:
+            return
+
+        value = instance._data.get(self.name)
+
+        if not value and instance._initialised:
+            value = self.generate_new_value()
+            instance._data[self.name] = value
+            instance._mark_as_changed(self.name)
+
+        return value
+
+    def __set__(self, instance, value):
+
+        if value is None and instance._initialised:
+            value = self.generate_new_value()
+
+        return super(SequenceField, self).__set__(instance, value)
+
+    def to_python(self, value):
+        if value is None:
+            value = self.generate_new_value()
+        return value

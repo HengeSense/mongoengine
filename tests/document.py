@@ -12,7 +12,7 @@ import weakref
 from fixtures import Base, Mixin, PickleEmbedded, PickleTest
 
 from mongoengine import *
-from mongoengine.base import BaseField
+from mongoengine.base import _document_registry, NotRegistered
 from mongoengine.connection import _get_db
 
 
@@ -289,6 +289,31 @@ class DocumentTest(unittest.TestCase):
         Zoo.drop_collection()
         Animal.drop_collection()
 
+    def test_reference_inheritance(self):
+        class Stats(Document):
+            created = DateTimeField(default=datetime.now)
+
+            meta = {'allow_inheritance': False}
+
+        class CompareStats(Document):
+            generated = DateTimeField(default=datetime.now)
+            stats = ListField(ReferenceField(Stats))
+
+        Stats.drop_collection()
+        CompareStats.drop_collection()
+
+        list_stats = []
+
+        for i in xrange(10):
+            s = Stats()
+            s.save()
+            list_stats.append(s)
+
+        cmp_stats = CompareStats(stats=list_stats)
+        cmp_stats.save()
+
+        self.assertEqual(list_stats, CompareStats.objects.first().stats)
+
     def test_inheritance(self):
         """Ensure that document may inherit fields from a superclass document.
         """
@@ -406,7 +431,7 @@ class DocumentTest(unittest.TestCase):
                 'allow_inheritance': False,
                 'indexes': ['name']
             }
-        collection.update({}, {"$unset": {"_types": 1, "_cls": 1}}, False, True)
+        collection.update({}, {"$unset": {"_types": 1, "_cls": 1}},  multi=True)
 
         # Confirm extra data is removed
         obj = collection.find_one()
@@ -665,6 +690,56 @@ class DocumentTest(unittest.TestCase):
 
         BlogPost.drop_collection()
 
+    def test_embedded_document_index(self):
+        """Tests settings an index on an embedded document
+        """
+        class Date(EmbeddedDocument):
+            year = IntField(db_field='yr')
+
+        class BlogPost(Document):
+            title = StringField()
+            date = EmbeddedDocumentField(Date)
+
+            meta = {
+                'indexes': [
+                    '-date.year'
+                ],
+            }
+
+        BlogPost.drop_collection()
+
+        info = BlogPost.objects._collection.index_information()
+        self.assertEqual(info.keys(), ['_types_1_date.yr_-1', '_id_'])
+        BlogPost.drop_collection()
+
+    def test_list_embedded_document_index(self):
+        """Ensure list embedded documents can be indexed
+        """
+        class Tag(EmbeddedDocument):
+            name = StringField(db_field='tag')
+
+        class BlogPost(Document):
+            title = StringField()
+            tags = ListField(EmbeddedDocumentField(Tag))
+
+            meta = {
+                'indexes': [
+                    'tags.name'
+                ],
+            }
+
+        BlogPost.drop_collection()
+
+        info = BlogPost.objects._collection.index_information()
+        # we don't use _types in with list fields by default
+        self.assertEqual(info.keys(), ['_id_', '_types_1', 'tags.tag_1'])
+
+        post1 = BlogPost(title="Embedded Indexes tests in place",
+                        tags=[Tag(name="about"), Tag(name="time")]
+                )
+        post1.save()
+        BlogPost.drop_collection()
+
     def test_geo_indexes_recursion(self):
 
         class User(Document):
@@ -722,7 +797,6 @@ class DocumentTest(unittest.TestCase):
         # Two posts with the same slug is not allowed
         post2 = BlogPost(title='test2', slug='test')
         self.assertRaises(OperationError, post2.save)
-
 
     def test_unique_with(self):
         """Ensure that unique_with constraints are applied to fields.
@@ -902,6 +976,32 @@ class DocumentTest(unittest.TestCase):
 
         User.drop_collection()
 
+
+    def test_document_not_registered(self):
+
+        class Place(Document):
+            name = StringField()
+
+        class NicePlace(Place):
+            pass
+
+        Place.drop_collection()
+
+        Place(name="London").save()
+        NicePlace(name="Buckingham Palace").save()
+
+        # Mimic Place and NicePlace definitions being in a different file
+        # and the NicePlace model not being imported in at query time.
+        @classmethod
+        def _get_subclasses(cls):
+            return {}
+        Place._get_subclasses = _get_subclasses
+
+        def query_without_importing_nice_place():
+            print Place.objects.all()
+        self.assertRaises(NotRegistered, query_without_importing_nice_place)
+
+
     def test_creation(self):
         """Ensure that document may be created using keyword arguments.
         """
@@ -1047,6 +1147,26 @@ class DocumentTest(unittest.TestCase):
             recipient.save(validate=False)
         except ValidationError:
             self.fail()
+
+    def test_save_to_a_value_that_equates_to_false(self):
+
+        class Thing(EmbeddedDocument):
+            count = IntField()
+
+        class User(Document):
+            thing = EmbeddedDocumentField(Thing)
+
+        User.drop_collection()
+
+        user = User(thing=Thing(count=1))
+        user.save()
+        user.reload()
+
+        user.thing.count = 0
+        user.save()
+
+        user.reload()
+        self.assertEquals(user.thing.count, 0)
 
     def test_save_max_recursion_not_hit(self):
 
@@ -1484,6 +1604,18 @@ class DocumentTest(unittest.TestCase):
         del(doc.embedded_field.list_field[2].list_field)
         self.assertEquals(doc._delta(), ({}, {'embedded_field.list_field.2.list_field': 1}))
 
+        doc.save()
+        doc.reload()
+
+        doc.dict_field['Embedded'] = embedded_1
+        doc.save()
+        doc.reload()
+
+        doc.dict_field['Embedded'].string_field = 'Hello World'
+        self.assertEquals(doc._get_changed_fields(), ['dict_field.Embedded.string_field'])
+        self.assertEquals(doc._delta(), ({'dict_field.Embedded.string_field': 'Hello World'}, {}))
+
+
     def test_delta_db_field(self):
 
         class Doc(Document):
@@ -1775,7 +1907,8 @@ class DocumentTest(unittest.TestCase):
         person.save()
 
         person = self.Person.objects.get()
-        self.assertTrue(person.comments_dict['first_post'].published)
+        self.assertFalse(person.comments_dict['first_post'].published)
+
     def test_delete(self):
         """Ensure that document may be deleted using the delete method.
         """
@@ -1835,6 +1968,58 @@ class DocumentTest(unittest.TestCase):
             self.assertEqual(comment_obj['content'], comment['content'])
 
         BlogPost.drop_collection()
+
+    def test_list_search_by_embedded(self):
+        class User(Document):
+            username = StringField(required=True)
+
+            meta = {'allow_inheritance': False}
+
+        class Comment(EmbeddedDocument):
+            comment = StringField()
+            user = ReferenceField(User,
+                                  required=True)
+
+            meta = {'allow_inheritance': False}
+
+        class Page(Document):
+            comments = ListField(EmbeddedDocumentField(Comment))
+            meta = {'allow_inheritance': False,
+                    'indexes': [
+                        {'fields': ['comments.user']}
+                    ]}
+
+        User.drop_collection()
+        Page.drop_collection()
+
+        u1 = User(username="wilson")
+        u1.save()
+
+        u2 = User(username="rozza")
+        u2.save()
+
+        u3 = User(username="hmarr")
+        u3.save()
+
+        p1 = Page(comments = [Comment(user=u1, comment="Its very good"),
+                              Comment(user=u2, comment="Hello world"),
+                              Comment(user=u3, comment="Ping Pong"),
+                              Comment(user=u1, comment="I like a beer")])
+        p1.save()
+
+        p2 = Page(comments = [Comment(user=u1, comment="Its very good"),
+                              Comment(user=u2, comment="Hello world")])
+        p2.save()
+
+        p3 = Page(comments = [Comment(user=u3, comment="Its very good")])
+        p3.save()
+
+        p4 = Page(comments = [Comment(user=u2, comment="Heavy Metal song")])
+        p4.save()
+
+        self.assertEqual([p1, p2], list(Page.objects.filter(comments__user=u1)))
+        self.assertEqual([p1, p2, p4], list(Page.objects.filter(comments__user=u2)))
+        self.assertEqual([p1, p3], list(Page.objects.filter(comments__user=u3)))
 
     def test_save_embedded_document(self):
         """Ensure that a document with an embedded document field may be
