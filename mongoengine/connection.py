@@ -1,4 +1,8 @@
 from pymongo import Connection, version
+try:
+    from pymongo import ReplicaSetConnection
+except ImportError:
+    ReplicaSetConnection = None
 
 
 __all__ = ['ConnectionError', 'connect', 'register_connection',
@@ -19,7 +23,7 @@ _dbs = {}
 
 def register_connection(alias, name, host='localhost', port=27017,
                         is_slave=False, read_preference=False, slaves=None,
-                        username=None, password=None):
+                        username=None, password=None, replica_set=None):
     """Add a connection.
 
     :param alias: the name that will be used to refer to this connection
@@ -44,7 +48,8 @@ def register_connection(alias, name, host='localhost', port=27017,
         'slaves': slaves or [],
         'username': username,
         'password': password,
-        'read_preference': read_preference
+        'read_preference': read_preference,
+        'replicaSet': replica_set,
     }
 
 
@@ -89,7 +94,11 @@ def get_connection(alias=DEFAULT_CONNECTION_NAME, reconnect=False):
             conn_settings.pop('read_preference')
 
         try:
-            _connections[alias] = Connection(**conn_settings)
+            if conn_settings['replicaSet'] and ReplicaSetConnection:
+                host = "%s:%s" % (conn_settings.pop('host'), conn_settings.pop('port'))
+                _connections[alias] = ReplicaSetConnection(host, **conn_settings)
+            else:
+                _connections[alias] = Connection(**conn_settings)
         except Exception, e:
             raise e
             raise ConnectionError('Cannot connect to database %s' % alias)
