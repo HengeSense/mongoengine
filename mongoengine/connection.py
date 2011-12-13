@@ -85,6 +85,8 @@ def get_connection(alias=DEFAULT_CONNECTION_NAME, reconnect=False):
             conn_settings.pop('is_slave')
             conn_settings.pop('username')
             conn_settings.pop('password')
+            if not conn_settings.get('replicaSet'):
+                conn_settings.pop('replicaSet')
         else:
             # Get all the slave connections
             slaves = []
@@ -92,9 +94,11 @@ def get_connection(alias=DEFAULT_CONNECTION_NAME, reconnect=False):
                 slaves.append(get_connection(slave_alias))
             conn_settings['slaves'] = slaves
             conn_settings.pop('read_preference')
+            if not conn_settings.get('replicaSet'):
+                conn_settings.pop('replicaSet')
 
         try:
-            if conn_settings['replicaSet'] and ReplicaSetConnection:
+            if conn_settings.get('replicaSet') and ReplicaSetConnection:
                 host = "%s:%s" % (conn_settings.pop('host'), conn_settings.pop('port'))
                 _connections[alias] = ReplicaSetConnection(host, **conn_settings)
             else:
