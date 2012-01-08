@@ -14,6 +14,7 @@ fetch documents from the database::
         print user.name
 
 .. note::
+
    Once the iteration finishes (when :class:`StopIteration` is raised),
    :meth:`~mongoengine.queryset.QuerySet.rewind` will be called so that the
    :class:`~mongoengine.queryset.QuerySet` may be iterated over again. The
@@ -39,29 +40,6 @@ syntax::
     # been written by a user whose 'country' field is set to 'uk'
     uk_pages = Page.objects(author__country='uk')
 
-Querying lists
---------------
-On most fields, this syntax will look up documents where the field specified
-matches the given value exactly, but when the field refers to a
-:class:`~mongoengine.ListField`, a single item may be provided, in which case
-lists that contain that item will be matched::
-
-    class Page(Document):
-        tags = ListField(StringField())
-
-    # This will match all pages that have the word 'coding' as an item in the
-    # 'tags' list
-    Page.objects(tags='coding')
-
-Raw queries
------------
-It is possible to provide a raw PyMongo query as a query parameter, which will
-be integrated directly into the query. This is done using the ``__raw__``
-keyword argument::
-
-    Page.objects(__raw__={'tags': 'coding'})
-
-.. versionadded:: 0.4
 
 Query operators
 ===============
@@ -98,27 +76,69 @@ expressions:
 * ``istartswith`` -- string field starts with value (case insensitive)
 * ``endswith`` -- string field ends with value
 * ``iendswith`` -- string field ends with value (case insensitive)
-
-.. versionadded:: 0.3
+* ``match``  -- performs an $elemMatch so you can match an entire document within an array
 
 There are a few special operators for performing geographical queries, that
 may used with :class:`~mongoengine.GeoPointField`\ s:
 
 * ``within_distance`` -- provide a list containing a point and a maximum
   distance (e.g. [(41.342, -87.653), 5])
+* ``within_spherical_distance`` -- Same as above but using the spherical geo model
+  (e.g. [(41.342, -87.653), 5/earth_radius])
+* ``near`` -- order the documents by how close they are to a given point
+* ``near_sphere`` -- Same as above but using the spherical geo model
 * ``within_box`` -- filter documents to those within a given bounding box (e.g.
   [(35.0, -125.0), (40.0, -100.0)])
-* ``near`` -- order the documents by how close they are to a given point
+* ``within_polygon`` -- filter documents to those within a given polygon (e.g.
+  [(41.91,-87.69), (41.92,-87.68), (41.91,-87.65), (41.89,-87.65)]).
+  .. note:: Requires Mongo Server 2.0
 
-.. versionadded:: 0.4
 
-Querying by position
-====================
+Querying lists
+--------------
+On most fields, this syntax will look up documents where the field specified
+matches the given value exactly, but when the field refers to a
+:class:`~mongoengine.ListField`, a single item may be provided, in which case
+lists that contain that item will be matched::
+
+    class Page(Document):
+        tags = ListField(StringField())
+
+    # This will match all pages that have the word 'coding' as an item in the
+    # 'tags' list
+    Page.objects(tags='coding')
+
 It is possible to query by position in a list by using a numerical value as a
 query operator. So if you wanted to find all pages whose first tag was ``db``,
 you could use the following query::
 
-    BlogPost.objects(tags__0='db')
+    Page.objects(tags__0='db')
+
+If you only want to fetch part of a list eg: you want to paginate a list, then
+the `slice` operator is required::
+
+    # comments - skip 5, limit 10
+    Page.objects.fields(slice__comments=[5, 10])
+
+For updating documents, if you don't know the position in a list, you can use
+the $ positional operator ::
+
+    Post.objects(comments__by="joe").update(**{'inc__comments__$__votes': 1})
+
+However, this doesn't map well to the syntax so you can also use a capital S instead ::
+
+    Post.objects(comments__by="joe").update(inc__comments__S__votes=1)
+
+    .. note:: Due to Mongo currently the $ operator only applies to the first matched item in the query.
+
+
+Raw queries
+-----------
+It is possible to provide a raw PyMongo query as a query parameter, which will
+be integrated directly into the query. This is done using the ``__raw__``
+keyword argument::
+
+    Page.objects(__raw__={'tags': 'coding'})
 
 .. versionadded:: 0.4
 
@@ -174,22 +194,6 @@ to be created::
     >>> b, created = User.objects.get_or_create(name='User A', defaults={'age': 40})
     >>> a.name == b.name and a.age == b.age
     True
-
-Dereferencing results
----------------------
-When iterating the results of :class:`~mongoengine.ListField` or
-:class:`~mongoengine.DictField` we automatically dereference any
-:class:`~pymongo.dbref.DBRef` objects as efficiently as possible, reducing the
-number the queries to mongo.
-
-There are times when that efficiency is not enough, documents that have
-:class:`~mongoengine.ReferenceField` objects or
-:class:`~mongoengine.GenericReferenceField` objects at the top level are
-expensive as the number of queries to MongoDB can quickly rise.
-
-To limit the number of queries use
-:func:`~mongoengine.queryset.QuerySet.select_related` which converts the
-QuerySet to a list and dereferences as efficiently as possible.
 
 Default Document queries
 ========================
@@ -270,6 +274,7 @@ You may sum over the values of a specific field on documents using
     yearly_expense = Employee.objects.sum('salary')
 
 .. note::
+
    If the field isn't present on a document, that document will be ignored from
    the sum.
 
@@ -292,8 +297,16 @@ would be generating "tag-clouds"::
     from operator import itemgetter
     top_tags = sorted(tag_freqs.items(), key=itemgetter(1), reverse=True)[:10]
 
+
+Query efficiency and performance
+================================
+
+There are a couple of methods to improve efficiency when querying, reducing the
+information returned by the query or efficient dereferencing .
+
 Retrieving a subset of fields
-=============================
+-----------------------------
+
 Sometimes a subset of fields on a :class:`~mongoengine.Document` is required,
 and for efficiency only these should be retrieved from the database. This issue
 is especially important for MongoDB, as fields may often be extremely large
@@ -318,8 +331,34 @@ will be given::
     >>> f.rating # default value
     3
 
+.. note::
+
+    The :meth:`~mongoengine.queryset.QuerySet.exclude` is the opposite of
+    :meth:`~mongoengine.queryset.QuerySet.only` if you want to exclude a field.
+
 If you later need the missing fields, just call
 :meth:`~mongoengine.Document.reload` on your document.
+
+Getting related data
+--------------------
+
+When iterating the results of :class:`~mongoengine.ListField` or
+:class:`~mongoengine.DictField` we automatically dereference any
+:class:`~pymongo.dbref.DBRef` objects as efficiently as possible, reducing the
+number the queries to mongo.
+
+There are times when that efficiency is not enough, documents that have
+:class:`~mongoengine.ReferenceField` objects or
+:class:`~mongoengine.GenericReferenceField` objects at the top level are
+expensive as the number of queries to MongoDB can quickly rise.
+
+To limit the number of queries use
+:func:`~mongoengine.queryset.QuerySet.select_related` which converts the
+QuerySet to a list and dereferences as efficiently as possible.  By default
+:func:`~mongoengine.queryset.QuerySet.select_related` only dereferences any
+references to the depth of 1 level.  If you have more complicated documents and
+want to dereference more of the object at once then increasing the :attr:`max_depth`
+will dereference more levels of the document.
 
 Advanced queries
 ================
@@ -340,6 +379,67 @@ calling it with keyword arguments::
 
     # Get top posts
     Post.objects((Q(featured=True) & Q(hits__gte=1000)) | Q(hits__gte=5000))
+
+.. _guide-atomic-updates:
+
+Atomic updates
+==============
+Documents may be updated atomically by using the
+:meth:`~mongoengine.queryset.QuerySet.update_one` and
+:meth:`~mongoengine.queryset.QuerySet.update` methods on a
+:meth:`~mongoengine.queryset.QuerySet`. There are several different "modifiers"
+that you may use with these methods:
+
+* ``set`` -- set a particular value
+* ``unset`` -- delete a particular value (since MongoDB v1.3+)
+* ``inc`` -- increment a value by a given amount
+* ``dec`` -- decrement a value by a given amount
+* ``pop`` -- remove the last item from a list
+* ``push`` -- append a value to a list
+* ``push_all`` -- append several values to a list
+* ``pop`` -- remove the first or last element of a list
+* ``pull`` -- remove a value from a list
+* ``pull_all`` -- remove several values from a list
+* ``add_to_set`` -- add value to a list only if its not in the list already
+
+The syntax for atomic updates is similar to the querying syntax, but the
+modifier comes before the field, not after it::
+
+    >>> post = BlogPost(title='Test', page_views=0, tags=['database'])
+    >>> post.save()
+    >>> BlogPost.objects(id=post.id).update_one(inc__page_views=1)
+    >>> post.reload()  # the document has been changed, so we need to reload it
+    >>> post.page_views
+    1
+    >>> BlogPost.objects(id=post.id).update_one(set__title='Example Post')
+    >>> post.reload()
+    >>> post.title
+    'Example Post'
+    >>> BlogPost.objects(id=post.id).update_one(push__tags='nosql')
+    >>> post.reload()
+    >>> post.tags
+    ['database', 'nosql']
+
+.. note ::
+
+    In version 0.5 the :meth:`~mongoengine.Document.save` runs atomic updates
+    on changed documents by tracking changes to that document.
+
+The positional operator allows you to update list items without knowing the
+index position, therefore making the update a single atomic operation.  As we
+cannot use the `$` syntax in keyword arguments it has been mapped to `S`::
+
+    >>> post = BlogPost(title='Test', page_views=0, tags=['database', 'mongo'])
+    >>> post.save()
+    >>> BlogPost.objects(id=post.id, tags='mongo').update(set__tags__S='mongodb')
+    >>> post.reload()
+    >>> post.tags
+    ['database', 'mongodb']
+
+.. note ::
+    Currently only top level lists are handled, future versions of mongodb /
+    pymongo plan to support nested positional operators.  See `The $ positional
+    operator <http://www.mongodb.org/display/DOCS/Updating#Updating-The%24positionaloperator>`_.
 
 Server-side javascript execution
 ================================
@@ -443,59 +543,3 @@ following example shows how the substitutions are made::
         return comments;
     }
     """)
-
-.. _guide-atomic-updates:
-
-Atomic updates
-==============
-Documents may be updated atomically by using the
-:meth:`~mongoengine.queryset.QuerySet.update_one` and
-:meth:`~mongoengine.queryset.QuerySet.update` methods on a
-:meth:`~mongoengine.queryset.QuerySet`. There are several different "modifiers"
-that you may use with these methods:
-
-* ``set`` -- set a particular value
-* ``unset`` -- delete a particular value (since MongoDB v1.3+)
-* ``inc`` -- increment a value by a given amount
-* ``dec`` -- decrement a value by a given amount
-* ``pop`` -- remove the last item from a list
-* ``push`` -- append a value to a list
-* ``push_all`` -- append several values to a list
-* ``pop`` -- remove the first or last element of a list
-* ``pull`` -- remove a value from a list
-* ``pull_all`` -- remove several values from a list
-* ``add_to_set`` -- add value to a list only if its not in the list already
-
-The syntax for atomic updates is similar to the querying syntax, but the
-modifier comes before the field, not after it::
-
-    >>> post = BlogPost(title='Test', page_views=0, tags=['database'])
-    >>> post.save()
-    >>> BlogPost.objects(id=post.id).update_one(inc__page_views=1)
-    >>> post.reload()  # the document has been changed, so we need to reload it
-    >>> post.page_views
-    1
-    >>> BlogPost.objects(id=post.id).update_one(set__title='Example Post')
-    >>> post.reload()
-    >>> post.title
-    'Example Post'
-    >>> BlogPost.objects(id=post.id).update_one(push__tags='nosql')
-    >>> post.reload()
-    >>> post.tags
-    ['database', 'nosql']
-
-The positional operator allows you to update list items without knowing the
-index position, therefore making the update a single atomic operation.  As we
-cannot use the `$` syntax in keyword arguments it has been mapped to `S`::
-
-    >>> post = BlogPost(title='Test', page_views=0, tags=['database', 'mongo'])
-    >>> post.save()
-    >>> BlogPost.objects(id=post.id, tags='mongo').update(set__tags__S='mongodb')
-    >>> post.reload()
-    >>> post.tags
-    ['database', 'mongodb']
-
-.. note ::
-    Currently only top level lists are handled, future versions of mongodb /
-    pymongo plan to support nested positional operators.  See `The $ positional
-    operator <http://www.mongodb.org/display/DOCS/Updating#Updating-The%24positionaloperator>`_.
